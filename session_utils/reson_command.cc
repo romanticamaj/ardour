@@ -407,16 +407,18 @@ source_json (std::shared_ptr<Source> const& source)
 	std::ostringstream out;
 	std::shared_ptr<FileSource> file_source = std::dynamic_pointer_cast<FileSource> (source);
 
-	out << "{\"id\":\"" << json_escape (source->id ().to_s ()) << "\""
-	    << ",\"name\":\"" << json_escape (source->name ()) << "\""
-	    << ",\"type\":\"" << data_type_name (source->type ()) << "\""
-	    << ",\"length\":" << source->length ().samples ()
-	    << ",\"naturalPosition\":" << source->natural_position ().samples ();
-
+	out << "{";
 	if (file_source) {
-		out << ",\"fileName\":\"" << json_escape (Glib::path_get_basename (file_source->path ())) << "\""
-		    << ",\"withinSession\":" << (file_source->within_session () ? "true" : "false")
-		    << ",\"channel\":" << file_source->channel ();
+		out << "\"channel\":" << file_source->channel () << ","
+		    << "\"fileName\":\"" << json_escape (Glib::path_get_basename (file_source->path ())) << "\",";
+	}
+	out << "\"id\":\"" << json_escape (source->id ().to_s ()) << "\""
+	    << ",\"length\":" << source->length ().samples ()
+	    << ",\"name\":\"" << json_escape (source->name ()) << "\""
+	    << ",\"naturalPosition\":" << source->natural_position ().samples ()
+	    << ",\"type\":\"" << data_type_name (source->type ()) << "\"";
+	if (file_source) {
+		out << ",\"withinSession\":" << (file_source->within_session () ? "true" : "false");
 	}
 
 	out << "}";
@@ -431,17 +433,14 @@ region_json (std::shared_ptr<Region> const& region)
 	uint32_t           source_count = audio_region ? audio_region->n_channels () : 1;
 
 	out << "{\"id\":\"" << json_escape (region->id ().to_s ()) << "\""
-	    << ",\"name\":\"" << json_escape (region->name ()) << "\""
-	    << ",\"type\":\"" << data_type_name (region->data_type ()) << "\""
-	    << ",\"position\":" << region->position_sample ()
-	    << ",\"start\":" << region->start_sample ()
-	    << ",\"length\":" << region->length_samples ()
 	    << ",\"lastSample\":" << region->last_sample ()
 	    << ",\"layer\":" << region->layer ()
-	    << ",\"muted\":" << (region->muted () ? "true" : "false")
-	    << ",\"opaque\":" << (region->opaque () ? "true" : "false")
-	    << ",\"wholeFile\":" << (region->whole_file () ? "true" : "false")
+	    << ",\"length\":" << region->length_samples ()
 	    << ",\"locked\":" << (region->locked () ? "true" : "false")
+	    << ",\"muted\":" << (region->muted () ? "true" : "false")
+	    << ",\"name\":\"" << json_escape (region->name ()) << "\""
+	    << ",\"opaque\":" << (region->opaque () ? "true" : "false")
+	    << ",\"position\":" << region->position_sample ()
 	    << ",\"positionLocked\":" << (region->position_locked () ? "true" : "false")
 	    << ",\"sourceCount\":" << source_count
 	    << ",\"sources\":[";
@@ -457,7 +456,11 @@ region_json (std::shared_ptr<Region> const& region)
 		out << source_json (source);
 	}
 
-	out << "]}";
+	out << "]"
+	    << ",\"start\":" << region->start_sample ()
+	    << ",\"type\":\"" << data_type_name (region->data_type ()) << "\""
+	    << ",\"wholeFile\":" << (region->whole_file () ? "true" : "false")
+	    << "}";
 	return out.str ();
 }
 
@@ -692,9 +695,7 @@ observe_session_json (Session& session)
 	std::ostringstream              out;
 	bool                            first = true;
 
-	out << "{\"sessionName\":\"" << json_escape (session.name ()) << "\"";
-	out << ",\"sampleRate\":" << session.nominal_sample_rate ();
-	out << ",\"routes\":[";
+	out << "{\"routes\":[";
 
 	if (routes) {
 		for (RouteList::const_iterator i = routes->begin (); i != routes->end (); ++i) {
@@ -706,19 +707,22 @@ observe_session_json (Session& session)
 				out << ",";
 			}
 			first = false;
-			out << "{\"id\":\"" << json_escape (route->id ().to_s ()) << "\""
-			    << ",\"name\":\"" << json_escape (route->name ()) << "\""
-			    << ",\"type\":\"" << route_type (route) << "\""
-			    << ",\"hidden\":" << (route->is_hidden () ? "true" : "false");
+			out << "{\"hidden\":" << (route->is_hidden () ? "true" : "false")
+			    << ",\"id\":\"" << json_escape (route->id ().to_s ()) << "\""
+			    << ",\"name\":\"" << json_escape (route->name ()) << "\"";
 			std::shared_ptr<AudioTrack> audio_track = std::dynamic_pointer_cast<AudioTrack> (route);
 			if (audio_track && audio_track->playlist ()) {
 				out << ",\"playlist\":" << playlist_json (audio_track->playlist ());
 			}
+			out << ",\"type\":\"" << route_type (route) << "\"";
 			out << "}";
 		}
 	}
 
-	out << "]}";
+	out << "]"
+	    << ",\"sampleRate\":" << session.nominal_sample_rate ()
+	    << ",\"sessionName\":\"" << json_escape (session.name ()) << "\""
+	    << "}";
 	return out.str ();
 }
 
