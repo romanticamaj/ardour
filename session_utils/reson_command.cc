@@ -735,10 +735,12 @@ static std::string
 journal_snapshot_path (std::string const& journal_path)
 {
 	std::string dirname = Glib::path_get_dirname (journal_path);
+	std::string journal_name = PBD::basename_nosuffix (Glib::path_get_basename (journal_path));
+	std::string snapshot_name = journal_name + "_batch_0001_before.tar.gz";
 	if (dirname == ".") {
-		return ".reson/snapshots/batch_0001_before.tar.gz";
+		return Glib::build_filename (".reson", "snapshots", snapshot_name);
 	}
-	return Glib::build_filename (dirname, "snapshots", "batch_0001_before.tar.gz");
+	return Glib::build_filename (dirname, "snapshots", snapshot_name);
 }
 
 static void
@@ -837,6 +839,43 @@ capture_session_snapshot (std::string const& session_dir, SnapshotInfo& snapshot
 			archive_write_free (ar);
 		}
 		throw;
+	}
+}
+
+static bool
+has_suffix (std::string const& value, std::string const& suffix)
+{
+	return value.size () >= suffix.size () && value.compare (value.size () - suffix.size (), suffix.size (), suffix) == 0;
+}
+
+static void
+prune_snapshots (std::string const& snapshot_path, uint32_t max_count)
+{
+	if (max_count == 0) {
+		return;
+	}
+
+	fs::path snapshot_dir = fs::path (snapshot_path).parent_path ();
+	if (snapshot_dir.empty () || !fs::exists (snapshot_dir)) {
+		return;
+	}
+
+	std::vector<std::pair<fs::file_time_type, fs::path> > snapshots;
+	for (fs::directory_iterator i (snapshot_dir), end; i != end; ++i) {
+		if (!fs::is_regular_file (i->path ())) {
+			continue;
+		}
+		std::string name = i->path ().filename ().string ();
+		if (!has_suffix (name, "_batch_0001_before.tar.gz")) {
+			continue;
+		}
+		snapshots.push_back (std::make_pair (fs::last_write_time (i->path ()), i->path ()));
+	}
+
+	std::sort (snapshots.begin (), snapshots.end ());
+	while (snapshots.size () > max_count) {
+		fs::remove (snapshots.front ().second);
+		snapshots.erase (snapshots.begin ());
 	}
 }
 
@@ -1075,6 +1114,7 @@ main (int argc, char* argv[])
 	std::ostringstream result;
 	bool               first_result = true;
 	std::string        journal_path = root.get<std::string> ("journalPath", "");
+	uint32_t           snapshot_retention_max_count = root.get<uint32_t> ("snapshotRetention.maxCount", 0);
 	std::string        journal_started_at = utc_now_json ();
 	std::vector<JournalEntry> journal_entries;
 	uint32_t           journal_entry_count = 0;
@@ -1136,6 +1176,7 @@ main (int argc, char* argv[])
 						throw std::runtime_error ("create_session snapshot save failed");
 					}
 					capture_session_snapshot (current_session_dir, snapshot);
+					prune_snapshots (snapshot.path, snapshot_retention_max_count);
 				}
 
 				result << ",\"ok\":true,\"sessionDir\":\"" << json_escape (session_dir) << "\""
@@ -1157,6 +1198,7 @@ main (int argc, char* argv[])
 				current_session_dir = session_dir;
 				if (!journal_path.empty ()) {
 					capture_session_snapshot (current_session_dir, snapshot);
+					prune_snapshots (snapshot.path, snapshot_retention_max_count);
 				}
 
 				result << ",\"ok\":true,\"sessionDir\":\"" << json_escape (session_dir) << "\""
