@@ -76,6 +76,13 @@ struct RenderSettings
 	bool                           broadcast;
 };
 
+struct RegionLocation
+{
+	std::shared_ptr<AudioTrack> track;
+	std::shared_ptr<Playlist>   playlist;
+	std::shared_ptr<Region>     region;
+};
+
 static double
 parse_time_number (std::string const& value)
 {
@@ -197,6 +204,45 @@ find_audio_track (Session& session, std::string const& track_id, std::string con
 	}
 
 	return std::shared_ptr<AudioTrack> ();
+}
+
+static RegionLocation
+find_region_location (Session& session, std::string const& region_id, std::string const& region_name)
+{
+	std::shared_ptr<RouteList const> routes = session.get_routes ();
+	if (!routes) {
+		return RegionLocation ();
+	}
+
+	for (RouteList::const_iterator i = routes->begin (); i != routes->end (); ++i) {
+		std::shared_ptr<AudioTrack> track = std::dynamic_pointer_cast<AudioTrack> (*i);
+		if (!track || !track->playlist ()) {
+			continue;
+		}
+
+		std::shared_ptr<RegionList> regions = track->playlist ()->region_list ();
+		for (RegionList::const_iterator r = regions->begin (); r != regions->end (); ++r) {
+			if (!*r) {
+				continue;
+			}
+			if (!region_id.empty () && (*r)->id ().to_s () == region_id) {
+				RegionLocation location;
+				location.track = track;
+				location.playlist = track->playlist ();
+				location.region = *r;
+				return location;
+			}
+			if (region_id.empty () && !region_name.empty () && (*r)->name () == region_name) {
+				RegionLocation location;
+				location.track = track;
+				location.playlist = track->playlist ();
+				location.region = *r;
+				return location;
+			}
+		}
+	}
+
+	return RegionLocation ();
 }
 
 static std::string
@@ -497,7 +543,7 @@ usage ()
 	std::cout << UTILNAME << " - run Reson JSON commands against an Ardour session.\n\n";
 	std::cout << "Usage: " << UTILNAME << " <command-file.json>\n\n";
 	std::cout << "Supported operations:\n";
-	std::cout << "  create_session, open_session, create_audio_track, import_audio, render, save_session, observe_session\n\n";
+	std::cout << "  create_session, open_session, create_audio_track, import_audio, place_audio, render, save_session, observe_session\n\n";
 	std::cout << "Example:\n";
 	std::cout << "  " << UTILNAME << " /tmp/reson-command.json\n";
 	::exit (EXIT_SUCCESS);
@@ -694,6 +740,55 @@ main (int argc, char* argv[])
 				       << ",\"trackName\":\"" << json_escape (track->name ()) << "\""
 				       << ",\"regionId\":\"" << json_escape (copy->id ().to_s ()) << "\""
 				       << ",\"regionName\":\"" << json_escape (copy->name ()) << "\""
+				       << ",\"start\":" << start;
+
+			} else if (op == "place_audio") {
+				require_session (session, op);
+
+				std::string region_id   = command.get<std::string> ("regionId", "");
+				std::string region_name = command.get<std::string> ("regionName", "");
+				std::string track_id    = command.get<std::string> ("trackId", "");
+				std::string track_name  = command.get<std::string> ("trackName", "");
+				std::string start_value = command.get<std::string> ("start");
+				samplepos_t start       = parse_position (*session, start_value);
+
+				if (region_id.empty () && region_name.empty ()) {
+					throw std::runtime_error ("place_audio requires regionId or regionName");
+				}
+
+				RegionLocation location = find_region_location (*session, region_id, region_name);
+				if (!location.region || !location.playlist || !location.track) {
+					throw std::runtime_error ("place_audio region not found");
+				}
+
+				std::shared_ptr<AudioTrack> target_track = location.track;
+				if (!track_id.empty () || !track_name.empty ()) {
+					target_track = find_audio_track (*session, track_id, track_name);
+					if (!target_track) {
+						throw std::runtime_error ("place_audio target track not found");
+					}
+				}
+				if (!target_track->playlist ()) {
+					throw std::runtime_error ("place_audio target track has no playlist");
+				}
+
+				if (target_track->playlist () == location.playlist) {
+					location.playlist->clear_changes ();
+					location.playlist->clear_owned_changes ();
+					location.region->set_position (timepos_t (start));
+				} else {
+					location.playlist->clear_changes ();
+					location.playlist->clear_owned_changes ();
+					target_track->playlist ()->clear_changes ();
+					target_track->playlist ()->clear_owned_changes ();
+					location.playlist->remove_region (location.region);
+					target_track->playlist ()->add_region (location.region, timepos_t (start));
+				}
+
+				result << ",\"ok\":true,\"regionId\":\"" << json_escape (location.region->id ().to_s ()) << "\""
+				       << ",\"regionName\":\"" << json_escape (location.region->name ()) << "\""
+				       << ",\"trackId\":\"" << json_escape (target_track->id ().to_s ()) << "\""
+				       << ",\"trackName\":\"" << json_escape (target_track->name ()) << "\""
 				       << ",\"start\":" << start;
 
 			} else if (op == "save_session") {
