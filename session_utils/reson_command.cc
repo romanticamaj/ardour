@@ -732,6 +732,15 @@ observe_hash (Session* session)
 }
 
 static std::string
+validated_batch_risk (std::string const& risk)
+{
+	if (risk == "low" || risk == "normal" || risk == "high") {
+		return risk;
+	}
+	throw std::runtime_error ("invalid batchRisk: " + risk);
+}
+
+static std::string
 journal_snapshot_path (std::string const& journal_path)
 {
 	std::string dirname = Glib::path_get_dirname (journal_path);
@@ -995,6 +1004,7 @@ write_command_journal (
 	std::string const&              journal_path,
 	std::string const&              created_at,
 	std::string const&              batch_status,
+	std::string const&              batch_risk,
 	Session*                        session,
 	SnapshotInfo const&             snapshot,
 	std::vector<JournalEntry> const& entries)
@@ -1017,7 +1027,7 @@ write_command_journal (
 	    << ",\"bridge\":{\"name\":\"ardour-session-utils\",\"version\":\"spike\",\"engineVersion\":\"" << json_escape (VERSIONSTRING) << "\"}"
 	    << ",\"batches\":[{\"batchId\":\"batch_0001\""
 	    << ",\"reason\":\"command-file\""
-	    << ",\"risk\":\"normal\""
+	    << ",\"risk\":\"" << json_escape (batch_risk) << "\""
 	    << ",\"startedAt\":\"" << json_escape (created_at) << "\""
 	    << ",\"completedAt\":\"" << json_escape (utc_now_json ()) << "\""
 	    << ",\"status\":\"" << json_escape (batch_status) << "\""
@@ -1114,6 +1124,9 @@ main (int argc, char* argv[])
 	std::ostringstream result;
 	bool               first_result = true;
 	std::string        journal_path = root.get<std::string> ("journalPath", "");
+	std::string        batch_risk_input = root.get<std::string> ("batchRisk", "normal");
+	std::string        batch_risk = "normal";
+	bool               high_risk_approved = root.get<bool> ("riskApproval.confirmed", false);
 	uint32_t           snapshot_retention_max_count = root.get<uint32_t> ("snapshotRetention.maxCount", 0);
 	std::string        journal_started_at = utc_now_json ();
 	std::vector<JournalEntry> journal_entries;
@@ -1130,6 +1143,11 @@ main (int argc, char* argv[])
 	result << "{\"schemaVersion\":\"reson.result.v0\",\"results\":[";
 
 	try {
+		batch_risk = validated_batch_risk (batch_risk_input);
+		if (batch_risk == "high" && !high_risk_approved) {
+			throw std::runtime_error ("high-risk batch requires riskApproval.confirmed=true");
+		}
+
 		pt::ptree const& commands = root.get_child ("commands");
 
 		for (pt::ptree::const_iterator i = commands.begin (); i != commands.end (); ++i) {
@@ -1458,7 +1476,7 @@ main (int argc, char* argv[])
 		}
 
 		if (!journal_path.empty ()) {
-			write_command_journal (journal_path, journal_started_at, "applied", session, snapshot, journal_entries);
+			write_command_journal (journal_path, journal_started_at, "applied", batch_risk, session, snapshot, journal_entries);
 		}
 
 	} catch (std::exception const& e) {
@@ -1471,7 +1489,7 @@ main (int argc, char* argv[])
 				journal_entry_pending = false;
 			}
 			try {
-				write_command_journal (journal_path, journal_started_at, "failed", session, snapshot, journal_entries);
+				write_command_journal (journal_path, journal_started_at, "failed", batch_risk, session, snapshot, journal_entries);
 			} catch (std::exception const& journal_error) {
 				std::cerr << "Error: cannot write failed journal: " << journal_error.what () << "\n";
 			}
