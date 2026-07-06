@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -29,6 +30,8 @@
 #include <string>
 #include <vector>
 
+#include <archive.h>
+#include <archive_entry.h>
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
 #include <glibmm.h>
@@ -63,6 +66,7 @@
 using namespace ARDOUR;
 using namespace SessionUtils;
 namespace pt = boost::property_tree;
+namespace fs = std::filesystem;
 
 struct RenderSettings
 {
@@ -98,6 +102,13 @@ struct JournalEntry
 	std::string touched_playlists;
 	std::string touched_regions;
 	std::string touched_sources;
+};
+
+struct SnapshotInfo
+{
+	std::string path;
+	std::string sha256;
+	bool        captured = false;
 };
 
 static double
@@ -183,6 +194,34 @@ sha256_json (std::string const& value)
 	}
 	std::string result = std::string ("sha256:") + digest;
 	g_free (digest);
+	return result;
+}
+
+static std::string
+sha256_file (std::string const& path)
+{
+	GChecksum* checksum = g_checksum_new (G_CHECKSUM_SHA256);
+	if (!checksum) {
+		throw std::runtime_error ("failed to create sha256 checksum");
+	}
+
+	std::ifstream file (path.c_str (), std::ios::in | std::ios::binary);
+	if (!file) {
+		g_checksum_free (checksum);
+		throw std::runtime_error ("cannot read file for sha256: " + path);
+	}
+
+	char buffer[16384];
+	while (file) {
+		file.read (buffer, sizeof (buffer));
+		std::streamsize count = file.gcount ();
+		if (count > 0) {
+			g_checksum_update (checksum, reinterpret_cast<guchar const*> (buffer), count);
+		}
+	}
+
+	std::string result = std::string ("sha256:") + g_checksum_get_string (checksum);
+	g_checksum_free (checksum);
 	return result;
 }
 
@@ -696,9 +735,191 @@ journal_snapshot_path (std::string const& journal_path)
 {
 	std::string dirname = Glib::path_get_dirname (journal_path);
 	if (dirname == ".") {
-		return ".reson/snapshots/batch_0001_before.tar.zst";
+		return ".reson/snapshots/batch_0001_before.tar.gz";
 	}
-	return Glib::build_filename (dirname, "snapshots", "batch_0001_before.tar.zst");
+	return Glib::build_filename (dirname, "snapshots", "batch_0001_before.tar.gz");
+}
+
+static void
+archive_check (int rc, archive* ar, std::string const& action)
+{
+	if (rc != ARCHIVE_OK) {
+		std::string detail = archive_error_string (ar) ? archive_error_string (ar) : "unknown archive error";
+		throw std::runtime_error (action + ": " + detail);
+	}
+}
+
+static void
+write_file_to_archive (archive* ar, fs::path const& file_path)
+{
+	std::ifstream file (file_path, std::ios::in | std::ios::binary);
+	if (!file) {
+		throw std::runtime_error ("cannot read snapshot file: " + file_path.string ());
+	}
+
+	char buffer[16384];
+	while (file) {
+		file.read (buffer, sizeof (buffer));
+		std::streamsize count = file.gcount ();
+		if (count > 0 && archive_write_data (ar, buffer, count) < 0) {
+			throw std::runtime_error ("write snapshot data: " + std::string (archive_error_string (ar)));
+		}
+	}
+}
+
+static void
+capture_session_snapshot (std::string const& session_dir, SnapshotInfo& snapshot)
+{
+	if (snapshot.captured) {
+		return;
+	}
+	if (session_dir.empty ()) {
+		throw std::runtime_error ("cannot capture snapshot without a sessionDir");
+	}
+	if (!fs::exists (session_dir)) {
+		throw std::runtime_error ("cannot capture snapshot; sessionDir does not exist: " + session_dir);
+	}
+
+	std::string snapshot_dir = Glib::path_get_dirname (snapshot.path);
+	if (!snapshot_dir.empty () && snapshot_dir != ".") {
+		g_mkdir_with_parents (snapshot_dir.c_str (), 0755);
+	}
+
+	archive* ar = archive_write_new ();
+	if (!ar) {
+		throw std::runtime_error ("cannot allocate snapshot archive");
+	}
+
+	try {
+		archive_check (archive_write_add_filter_gzip (ar), ar, "enable gzip snapshot filter");
+		archive_check (archive_write_set_format_pax_restricted (ar), ar, "set snapshot archive format");
+		archive_check (archive_write_open_filename (ar, snapshot.path.c_str ()), ar, "open snapshot archive");
+
+		fs::path root (session_dir);
+		for (fs::recursive_directory_iterator i (root), end; i != end; ++i) {
+			fs::path path = i->path ();
+			fs::path rel  = fs::relative (path, root);
+			if (rel.empty ()) {
+				continue;
+			}
+
+			archive_entry* entry = archive_entry_new ();
+			if (!entry) {
+				throw std::runtime_error ("cannot allocate snapshot archive entry");
+			}
+
+			std::string rel_name = rel.generic_string ();
+			archive_entry_set_pathname (entry, rel_name.c_str ());
+			if (fs::is_directory (path)) {
+				archive_entry_set_filetype (entry, AE_IFDIR);
+				archive_entry_set_perm (entry, 0755);
+				archive_entry_set_size (entry, 0);
+				archive_check (archive_write_header (ar, entry), ar, "write snapshot directory header");
+			} else if (fs::is_regular_file (path)) {
+				archive_entry_set_filetype (entry, AE_IFREG);
+				archive_entry_set_perm (entry, 0644);
+				archive_entry_set_size (entry, fs::file_size (path));
+				archive_check (archive_write_header (ar, entry), ar, "write snapshot file header");
+				write_file_to_archive (ar, path);
+			}
+			archive_entry_free (entry);
+		}
+
+		archive_check (archive_write_close (ar), ar, "close snapshot archive");
+		archive_write_free (ar);
+		ar = 0;
+		snapshot.sha256 = sha256_file (snapshot.path);
+		snapshot.captured = true;
+	} catch (...) {
+		if (ar) {
+			archive_write_close (ar);
+			archive_write_free (ar);
+		}
+		throw;
+	}
+}
+
+static bool
+safe_archive_path (std::string const& name)
+{
+	fs::path path (name);
+	if (path.is_absolute ()) {
+		return false;
+	}
+	for (fs::path::const_iterator i = path.begin (); i != path.end (); ++i) {
+		if (*i == "..") {
+			return false;
+		}
+	}
+	return true;
+}
+
+static void
+restore_session_snapshot (std::string const& snapshot_path, std::string const& session_dir)
+{
+	if (snapshot_path.empty () || session_dir.empty ()) {
+		throw std::runtime_error ("restore_batch_snapshot requires snapshotPath and sessionDir");
+	}
+	if (!fs::exists (snapshot_path)) {
+		throw std::runtime_error ("snapshotPath does not exist: " + snapshot_path);
+	}
+
+	fs::remove_all (session_dir);
+	fs::create_directories (session_dir);
+
+	archive* ar = archive_read_new ();
+	if (!ar) {
+		throw std::runtime_error ("cannot allocate snapshot reader");
+	}
+
+	try {
+		archive_read_support_format_tar (ar);
+		archive_read_support_filter_gzip (ar);
+		archive_check (archive_read_open_filename (ar, snapshot_path.c_str (), 16384), ar, "open snapshot archive");
+
+		archive_entry* entry = 0;
+		while (true) {
+			int rc = archive_read_next_header (ar, &entry);
+			if (rc == ARCHIVE_EOF) {
+				break;
+			}
+			archive_check (rc, ar, "read snapshot entry");
+
+			std::string rel_name = archive_entry_pathname (entry) ? archive_entry_pathname (entry) : "";
+			if (!safe_archive_path (rel_name)) {
+				throw std::runtime_error ("unsafe snapshot entry path: " + rel_name);
+			}
+
+			fs::path target = fs::path (session_dir) / rel_name;
+			if (archive_entry_filetype (entry) == AE_IFDIR) {
+				fs::create_directories (target);
+			} else if (archive_entry_filetype (entry) == AE_IFREG) {
+				fs::create_directories (target.parent_path ());
+				std::ofstream file (target, std::ios::out | std::ios::binary | std::ios::trunc);
+				if (!file) {
+					throw std::runtime_error ("cannot restore snapshot file: " + target.string ());
+				}
+				char buffer[16384];
+				while (true) {
+					ssize_t count = archive_read_data (ar, buffer, sizeof (buffer));
+					if (count == 0) {
+						break;
+					}
+					if (count < 0) {
+						throw std::runtime_error ("read snapshot data: " + std::string (archive_error_string (ar)));
+					}
+					file.write (buffer, count);
+				}
+			}
+		}
+
+		archive_check (archive_read_close (ar), ar, "close snapshot archive");
+		archive_read_free (ar);
+	} catch (...) {
+		archive_read_close (ar);
+		archive_read_free (ar);
+		throw;
+	}
 }
 
 static void
@@ -734,17 +955,12 @@ write_command_journal (
 	std::string const&              journal_path,
 	std::string const&              created_at,
 	Session*                        session,
+	SnapshotInfo const&             snapshot,
 	std::vector<JournalEntry> const& entries)
 {
 	std::string dirname = Glib::path_get_dirname (journal_path);
 	if (!dirname.empty () && dirname != ".") {
 		g_mkdir_with_parents (dirname.c_str (), 0755);
-	}
-
-	std::string snapshot_path = journal_snapshot_path (journal_path);
-	std::string snapshot_dir  = Glib::path_get_dirname (snapshot_path);
-	if (!snapshot_dir.empty () && snapshot_dir != ".") {
-		g_mkdir_with_parents (snapshot_dir.c_str (), 0755);
 	}
 
 	std::ostringstream out;
@@ -764,7 +980,11 @@ write_command_journal (
 	    << ",\"startedAt\":\"" << json_escape (created_at) << "\""
 	    << ",\"completedAt\":\"" << json_escape (utc_now_json ()) << "\""
 	    << ",\"status\":\"applied\""
-	    << ",\"preState\":{\"snapshot\":{\"kind\":\"session_archive\",\"path\":\"" << json_escape (snapshot_path) << "\"}}"
+	    << ",\"preState\":{\"snapshot\":{\"kind\":\"session_archive\",\"path\":\"" << json_escape (snapshot.path) << "\"";
+	if (!snapshot.sha256.empty ()) {
+		out << ",\"sha256\":\"" << json_escape (snapshot.sha256) << "\"";
+	}
+	out << "}}"
 	    << ",\"postState\":{";
 	if (session) {
 		out << "\"observationHash\":\"" << observe_hash (session) << "\"";
@@ -823,7 +1043,7 @@ usage ()
 	std::cout << UTILNAME << " - run Reson JSON commands against an Ardour session.\n\n";
 	std::cout << "Usage: " << UTILNAME << " <command-file.json>\n\n";
 	std::cout << "Supported operations:\n";
-	std::cout << "  create_session, open_session, create_audio_track, import_audio, place_audio, render, save_session, observe_session\n\n";
+	std::cout << "  create_session, open_session, restore_batch_snapshot, create_audio_track, import_audio, place_audio, render, save_session, observe_session\n\n";
 	std::cout << "Example:\n";
 	std::cout << "  " << UTILNAME << " /tmp/reson-command.json\n";
 	::exit (EXIT_SUCCESS);
@@ -852,6 +1072,12 @@ main (int argc, char* argv[])
 	std::string        journal_started_at = utc_now_json ();
 	std::vector<JournalEntry> journal_entries;
 	uint32_t           journal_entry_count = 0;
+	std::string        current_session_dir;
+	SnapshotInfo       snapshot;
+
+	if (!journal_path.empty ()) {
+		snapshot.path = journal_snapshot_path (journal_path);
+	}
 
 	result << "{\"schemaVersion\":\"reson.result.v0\",\"results\":[";
 
@@ -894,6 +1120,13 @@ main (int argc, char* argv[])
 				if (!session) {
 					throw std::runtime_error ("create_session failed");
 				}
+				current_session_dir = session_dir;
+				if (!journal_path.empty ()) {
+					if (session->save_state ("") != 0) {
+						throw std::runtime_error ("create_session snapshot save failed");
+					}
+					capture_session_snapshot (current_session_dir, snapshot);
+				}
 
 				result << ",\"ok\":true,\"sessionDir\":\"" << json_escape (session_dir) << "\""
 				       << ",\"sessionName\":\"" << json_escape (session_name) << "\"";
@@ -911,9 +1144,29 @@ main (int argc, char* argv[])
 				if (!session) {
 					throw std::runtime_error ("open_session failed");
 				}
+				current_session_dir = session_dir;
+				if (!journal_path.empty ()) {
+					capture_session_snapshot (current_session_dir, snapshot);
+				}
 
 				result << ",\"ok\":true,\"sessionDir\":\"" << json_escape (session_dir) << "\""
 				       << ",\"sessionName\":\"" << json_escape (session_name) << "\"";
+
+			} else if (op == "restore_batch_snapshot") {
+				std::string snapshot_path = command.get<std::string> ("snapshotPath");
+				std::string session_dir   = command.get<std::string> ("sessionDir");
+				std::string session_name  = command.get<std::string> ("sessionName", default_session_name (session_dir));
+
+				if (session) {
+					SessionUtils::unload_session (session);
+					session = 0;
+				}
+
+				restore_session_snapshot (snapshot_path, session_dir);
+				current_session_dir = session_dir;
+				result << ",\"ok\":true,\"sessionDir\":\"" << json_escape (session_dir) << "\""
+				       << ",\"sessionName\":\"" << json_escape (session_name) << "\""
+				       << ",\"snapshotPath\":\"" << json_escape (snapshot_path) << "\"";
 
 			} else if (op == "create_audio_track") {
 				require_session (session, op);
@@ -1152,7 +1405,7 @@ main (int argc, char* argv[])
 		}
 
 		if (!journal_path.empty ()) {
-			write_command_journal (journal_path, journal_started_at, session, journal_entries);
+			write_command_journal (journal_path, journal_started_at, session, snapshot, journal_entries);
 		}
 
 	} catch (std::exception const& e) {
