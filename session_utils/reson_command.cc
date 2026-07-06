@@ -16,6 +16,7 @@
  * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
  */
 
+#include <algorithm>
 #include <cstdlib>
 #include <cmath>
 #include <fstream>
@@ -30,8 +31,18 @@
 #include <boost/property_tree/ptree.hpp>
 #include <glibmm.h>
 
+#include "pbd/basename.h"
+#include "pbd/enumwriter.h"
+
 #include "ardour/audioregion.h"
 #include "ardour/audio_track.h"
+#include "ardour/broadcast_info.h"
+#include "ardour/export_channel_configuration.h"
+#include "ardour/export_filename.h"
+#include "ardour/export_format_specification.h"
+#include "ardour/export_handler.h"
+#include "ardour/export_status.h"
+#include "ardour/export_timespan.h"
 #include "ardour/import_status.h"
 #include "ardour/midi_track.h"
 #include "ardour/playlist.h"
@@ -41,6 +52,7 @@
 #include "ardour/route.h"
 #include "ardour/session.h"
 #include "ardour/source.h"
+#include "ardour/track.h"
 #include "ardour/utils.h"
 
 #include "common.h"
@@ -48,6 +60,21 @@
 using namespace ARDOUR;
 using namespace SessionUtils;
 namespace pt = boost::property_tree;
+
+struct RenderSettings
+{
+	RenderSettings ()
+		: sample_rate (0)
+		, sample_format (ExportFormatBase::SF_16)
+		, normalize (false)
+		, broadcast (false)
+	{}
+
+	int                            sample_rate;
+	ExportFormatBase::SampleFormat sample_format;
+	bool                           normalize;
+	bool                           broadcast;
+};
 
 static double
 parse_time_number (std::string const& value)
@@ -183,6 +210,241 @@ unique_region_name (std::string const& initial_name)
 }
 
 static std::string
+sample_format_name (ExportFormatBase::SampleFormat sample_format)
+{
+	return enum_2_string (sample_format);
+}
+
+static ExportFormatBase::SampleFormat
+parse_sample_format (std::string const& value)
+{
+	if (value == "16") {
+		return ExportFormatBase::SF_16;
+	}
+	if (value == "24") {
+		return ExportFormatBase::SF_24;
+	}
+	if (value == "32") {
+		return ExportFormatBase::SF_32;
+	}
+	if (value == "float") {
+		return ExportFormatBase::SF_Float;
+	}
+	throw std::runtime_error ("invalid render bitDepth: " + value);
+}
+
+static std::string
+render_output_path (std::string const& outfile)
+{
+	std::string dirname  = Glib::path_get_dirname (outfile);
+	std::string basename = Glib::path_get_basename (outfile);
+
+	if (basename.size () > 4 && !basename.compare (basename.size () - 4, 4, ".wav")) {
+		basename = PBD::basename_nosuffix (basename);
+	}
+
+	return Glib::build_filename (dirname, basename + ".wav");
+}
+
+static bool
+render_range_from_playlists (Session& session, samplepos_t& start, samplepos_t& end)
+{
+	std::shared_ptr<RouteList const> routes = session.get_routes ();
+	bool                            have_range = false;
+
+	if (!routes) {
+		return false;
+	}
+
+	for (RouteList::const_iterator i = routes->begin (); i != routes->end (); ++i) {
+		std::shared_ptr<AudioTrack> track = std::dynamic_pointer_cast<AudioTrack> (*i);
+		if (!track || !track->playlist ()) {
+			continue;
+		}
+
+		std::pair<timepos_t, timepos_t> extent = track->playlist ()->get_extent ();
+		samplepos_t                     route_start = extent.first.samples ();
+		samplepos_t                     route_end   = extent.second.samples ();
+		if (route_end <= route_start) {
+			continue;
+		}
+
+		if (!have_range) {
+			start = route_start;
+			end = route_end;
+			have_range = true;
+		} else {
+			start = std::min (start, route_start);
+			end = std::max (end, route_end);
+		}
+	}
+
+	return have_range;
+}
+
+static uint32_t
+register_master_export_channels (Session& session, std::shared_ptr<ExportChannelConfiguration> const& channels)
+{
+	if (!session.master_out ()) {
+		return 0;
+	}
+
+	IO* master_out = session.master_out ()->output ().get ();
+	if (!master_out) {
+		return 0;
+	}
+
+	for (uint32_t n = 0; n < master_out->n_ports ().n_audio (); ++n) {
+		PortExportChannel* channel = new PortExportChannel ();
+		channel->add_port (master_out->audio (n));
+		ExportChannelPtr channel_ptr (channel);
+		channels->register_channel (channel_ptr);
+	}
+
+	return master_out->n_ports ().n_audio ();
+}
+
+static uint32_t
+register_track_export_channels (Session& session, std::shared_ptr<ExportChannelConfiguration> const& channels)
+{
+	std::shared_ptr<RouteList const> routes = session.get_routes ();
+	uint32_t                        max_audio_outputs = 0;
+
+	if (!routes) {
+		return 0;
+	}
+
+	for (RouteList::const_iterator i = routes->begin (); i != routes->end (); ++i) {
+		std::shared_ptr<AudioTrack> track = std::dynamic_pointer_cast<AudioTrack> (*i);
+		if (!track || !track->output ()) {
+			continue;
+		}
+		max_audio_outputs = std::max (max_audio_outputs, track->output ()->n_ports ().n_audio ());
+	}
+
+	for (uint32_t n = 0; n < max_audio_outputs; ++n) {
+		PortExportChannel* channel = new PortExportChannel ();
+		bool               added = false;
+
+		for (RouteList::const_iterator i = routes->begin (); i != routes->end (); ++i) {
+			std::shared_ptr<AudioTrack> track = std::dynamic_pointer_cast<AudioTrack> (*i);
+			if (!track || !track->output () || track->output ()->n_ports ().n_audio () <= n) {
+				continue;
+			}
+			channel->add_port (track->output ()->audio (n));
+			added = true;
+		}
+
+		if (added) {
+			ExportChannelPtr channel_ptr (channel);
+			channels->register_channel (channel_ptr);
+		} else {
+			delete channel;
+		}
+	}
+
+	return max_audio_outputs;
+}
+
+static int
+render_session (Session& session, std::string const& outfile, RenderSettings const& settings)
+{
+	ExportTimespanPtr                         timespan = session.get_export_handler ()->add_timespan ();
+	std::shared_ptr<ExportChannelConfiguration> channels = session.get_export_handler ()->add_channel_config ();
+	std::shared_ptr<ExportFilename>           filename = session.get_export_handler ()->add_filename ();
+	std::shared_ptr<BroadcastInfo>            broadcast_info;
+	int                                       sample_rate = settings.sample_rate ? settings.sample_rate : session.nominal_sample_rate ();
+
+	XMLTree tree;
+	std::ostringstream format_xml;
+	format_xml
+		<< "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+		<< "<ExportFormatSpecification name=\"RESON-WAV-EXPORT\" id=\"b1280899-0459-4aef-9dc9-7e2277fa6d24\">"
+		<< "  <Encoding id=\"F_WAV\" type=\"T_Sndfile\" extension=\"wav\" name=\"WAV\" has-sample-format=\"true\" channel-limit=\"256\"/>"
+		<< "  <SampleRate rate=\"" << sample_rate << "\"/>"
+		<< "  <SRCQuality quality=\"SRC_SincBest\"/>"
+		<< "  <EncodingOptions>"
+		<< "    <Option name=\"sample-format\" value=\"" << sample_format_name (settings.sample_format) << "\"/>"
+		<< "    <Option name=\"dithering\" value=\"D_None\"/>"
+		<< "    <Option name=\"tag-metadata\" value=\"true\"/>"
+		<< "    <Option name=\"tag-support\" value=\"false\"/>"
+		<< "    <Option name=\"broadcast-info\" value=\"" << (settings.broadcast ? "true" : "false") << "\"/>"
+		<< "  </EncodingOptions>"
+		<< "  <Processing>"
+		<< "    <Normalize enabled=\"" << (settings.normalize ? "true" : "false") << "\" target=\"0\"/>"
+		<< "    <Silence>"
+		<< "      <Start>"
+		<< "        <Trim enabled=\"false\"/>"
+		<< "        <Add enabled=\"false\">"
+		<< "          <Duration format=\"Timecode\" hours=\"0\" minutes=\"0\" seconds=\"0\" frames=\"0\"/>"
+		<< "        </Add>"
+		<< "      </Start>"
+		<< "      <End>"
+		<< "        <Trim enabled=\"false\"/>"
+		<< "        <Add enabled=\"false\">"
+		<< "          <Duration format=\"Timecode\" hours=\"0\" minutes=\"0\" seconds=\"0\" frames=\"0\"/>"
+		<< "        </Add>"
+		<< "      </End>"
+		<< "    </Silence>"
+		<< "  </Processing>"
+		<< "</ExportFormatSpecification>";
+
+	tree.read_buffer (format_xml.str ().c_str ());
+	std::shared_ptr<ExportFormatSpecification> format = session.get_export_handler ()->add_format (*tree.root ());
+
+	samplepos_t start = session.current_start_sample ();
+	samplepos_t end   = session.current_end_sample ();
+	if (end <= start) {
+		render_range_from_playlists (session, start, end);
+	}
+	if (end <= start) {
+		throw std::runtime_error ("render range is empty");
+	}
+
+	timespan->set_range (start, end);
+	timespan->set_range_id ("session");
+
+	uint32_t channel_count = register_master_export_channels (session, channels);
+	if (channel_count == 0) {
+		channel_count = register_track_export_channels (session, channels);
+	}
+	if (channel_count == 0) {
+		throw std::runtime_error ("render requires audio output ports");
+	}
+
+	std::string dirname  = Glib::path_get_dirname (outfile);
+	std::string basename = Glib::path_get_basename (outfile);
+	if (basename.size () > 4 && !basename.compare (basename.size () - 4, 4, ".wav")) {
+		basename = PBD::basename_nosuffix (basename);
+	}
+
+	filename->set_folder (dirname);
+	timespan->set_name (basename);
+
+	if (settings.broadcast) {
+		broadcast_info.reset (new BroadcastInfo);
+		broadcast_info->set_from_session (session, timespan->get_start ());
+	}
+
+	filename->set_timespan (timespan);
+	filename->include_label = false;
+	format->set_soundcloud_upload (false);
+	session.get_export_handler ()->add_export_config (timespan, channels, format, filename, broadcast_info);
+
+	if (session.get_export_handler ()->do_export () != 0) {
+		return -1;
+	}
+
+	std::shared_ptr<ExportStatus> status = session.get_export_status ();
+	while (status->running ()) {
+		Glib::usleep (100000);
+	}
+	status->finish (TRS_UI);
+
+	return 0;
+}
+
+static std::string
 observe_session_json (Session& session)
 {
 	std::shared_ptr<RouteList const> routes = session.get_routes ();
@@ -235,7 +497,7 @@ usage ()
 	std::cout << UTILNAME << " - run Reson JSON commands against an Ardour session.\n\n";
 	std::cout << "Usage: " << UTILNAME << " <command-file.json>\n\n";
 	std::cout << "Supported operations:\n";
-	std::cout << "  create_session, open_session, create_audio_track, import_audio, save_session, observe_session\n\n";
+	std::cout << "  create_session, open_session, create_audio_track, import_audio, render, save_session, observe_session\n\n";
 	std::cout << "Example:\n";
 	std::cout << "  " << UTILNAME << " /tmp/reson-command.json\n";
 	::exit (EXIT_SUCCESS);
@@ -441,6 +703,28 @@ main (int argc, char* argv[])
 					throw std::runtime_error ("save_session failed");
 				}
 				result << ",\"ok\":true";
+
+			} else if (op == "render") {
+				require_session (session, op);
+
+				std::string    output_path = command.get<std::string> ("outputPath");
+				RenderSettings settings;
+				settings.sample_rate   = command.get<int> ("sampleRate", session->nominal_sample_rate ());
+				settings.sample_format = parse_sample_format (command.get<std::string> ("bitDepth", "16"));
+				settings.normalize     = command.get<bool> ("normalize", false);
+				settings.broadcast     = command.get<bool> ("broadcast", false);
+
+				if (settings.sample_rate < 8000 || settings.sample_rate > 192000) {
+					throw std::runtime_error ("invalid render sampleRate");
+				}
+
+				if (render_session (*session, output_path, settings) != 0) {
+					throw std::runtime_error ("render failed");
+				}
+
+				result << ",\"ok\":true,\"outputPath\":\"" << json_escape (render_output_path (output_path)) << "\""
+				       << ",\"sampleRate\":" << settings.sample_rate
+				       << ",\"bitDepth\":\"" << json_escape (command.get<std::string> ("bitDepth", "16")) << "\"";
 
 			} else if (op == "observe_session") {
 				require_session (session, op);
