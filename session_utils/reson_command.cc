@@ -102,6 +102,7 @@ struct JournalEntry
 	std::string touched_playlists;
 	std::string touched_regions;
 	std::string touched_sources;
+	std::string error_message;
 };
 
 struct SnapshotInfo
@@ -954,6 +955,7 @@ static void
 write_command_journal (
 	std::string const&              journal_path,
 	std::string const&              created_at,
+	std::string const&              batch_status,
 	Session*                        session,
 	SnapshotInfo const&             snapshot,
 	std::vector<JournalEntry> const& entries)
@@ -979,7 +981,7 @@ write_command_journal (
 	    << ",\"risk\":\"normal\""
 	    << ",\"startedAt\":\"" << json_escape (created_at) << "\""
 	    << ",\"completedAt\":\"" << json_escape (utc_now_json ()) << "\""
-	    << ",\"status\":\"applied\""
+	    << ",\"status\":\"" << json_escape (batch_status) << "\""
 	    << ",\"preState\":{\"snapshot\":{\"kind\":\"session_archive\",\"path\":\"" << json_escape (snapshot.path) << "\"";
 	if (!snapshot.sha256.empty ()) {
 		out << ",\"sha256\":\"" << json_escape (snapshot.sha256) << "\"";
@@ -1011,7 +1013,11 @@ write_command_journal (
 		if (!i->post_hash.empty ()) {
 			out << "\"observationHash\":\"" << i->post_hash << "\"";
 		}
-		out << "},\"rollback\":{\"kind\":\"restore_batch_snapshot\",\"batchId\":\"batch_0001\"}}";
+		out << "},\"rollback\":{\"kind\":\"restore_batch_snapshot\",\"batchId\":\"batch_0001\"}";
+		if (!i->error_message.empty ()) {
+			out << ",\"error\":{\"message\":\"" << json_escape (i->error_message) << "\"}";
+		}
+		out << "}";
 	}
 
 	out << "]}]}";
@@ -1074,6 +1080,8 @@ main (int argc, char* argv[])
 	uint32_t           journal_entry_count = 0;
 	std::string        current_session_dir;
 	SnapshotInfo       snapshot;
+	JournalEntry       journal_entry;
+	bool               journal_entry_pending = false;
 
 	if (!journal_path.empty ()) {
 		snapshot.path = journal_snapshot_path (journal_path);
@@ -1087,7 +1095,8 @@ main (int argc, char* argv[])
 		for (pt::ptree::const_iterator i = commands.begin (); i != commands.end (); ++i) {
 			pt::ptree const& command = i->second;
 			std::string      op      = command.get<std::string> ("op");
-			JournalEntry     journal_entry;
+			journal_entry = JournalEntry ();
+			journal_entry_pending = false;
 
 			if (!journal_path.empty ()) {
 				++journal_entry_count;
@@ -1098,6 +1107,7 @@ main (int argc, char* argv[])
 				journal_entry.command_json = ptree_json (command);
 				journal_entry.status = "applied";
 				journal_entry.pre_hash = observe_hash (session);
+				journal_entry_pending = true;
 			}
 
 			if (!first_result) {
@@ -1399,16 +1409,31 @@ main (int argc, char* argv[])
 			if (!journal_path.empty ()) {
 				journal_entry.post_hash = observe_hash (session);
 				journal_entries.push_back (journal_entry);
+				journal_entry_pending = false;
 			}
 
 			result << "}";
 		}
 
 		if (!journal_path.empty ()) {
-			write_command_journal (journal_path, journal_started_at, session, snapshot, journal_entries);
+			write_command_journal (journal_path, journal_started_at, "applied", session, snapshot, journal_entries);
 		}
 
 	} catch (std::exception const& e) {
+		if (!journal_path.empty ()) {
+			if (journal_entry_pending) {
+				journal_entry.status = "failed";
+				journal_entry.error_message = e.what ();
+				journal_entry.post_hash = observe_hash (session);
+				journal_entries.push_back (journal_entry);
+				journal_entry_pending = false;
+			}
+			try {
+				write_command_journal (journal_path, journal_started_at, "failed", session, snapshot, journal_entries);
+			} catch (std::exception const& journal_error) {
+				std::cerr << "Error: cannot write failed journal: " << journal_error.what () << "\n";
+			}
+		}
 		if (session) {
 			SessionUtils::unload_session (session);
 		}
