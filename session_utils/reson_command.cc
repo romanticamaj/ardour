@@ -19,7 +19,9 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cmath>
+#include <ctime>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -84,6 +86,20 @@ struct RegionLocation
 	std::shared_ptr<Region>     region;
 };
 
+struct JournalEntry
+{
+	std::string entry_id;
+	std::string op;
+	std::string command_json;
+	std::string status;
+	std::string pre_hash;
+	std::string post_hash;
+	std::string touched_tracks;
+	std::string touched_playlists;
+	std::string touched_regions;
+	std::string touched_sources;
+};
+
 static double
 parse_time_number (std::string const& value)
 {
@@ -128,6 +144,46 @@ json_escape (std::string const& input)
 		}
 	}
 	return out.str ();
+}
+
+static std::string
+ptree_json (pt::ptree const& tree)
+{
+	std::ostringstream out;
+	pt::write_json (out, tree, false);
+	std::string json = out.str ();
+	while (!json.empty () && (json[json.size () - 1] == '\n' || json[json.size () - 1] == '\r')) {
+		json.erase (json.size () - 1);
+	}
+	return json;
+}
+
+static std::string
+utc_now_json ()
+{
+	std::time_t now = std::time (0);
+	std::tm     tm;
+#ifdef _WIN32
+	gmtime_s (&tm, &now);
+#else
+	gmtime_r (&now, &tm);
+#endif
+
+	std::ostringstream out;
+	out << std::put_time (&tm, "%Y-%m-%dT%H:%M:%SZ");
+	return out.str ();
+}
+
+static std::string
+sha256_json (std::string const& value)
+{
+	gchar* digest = g_compute_checksum_for_string (G_CHECKSUM_SHA256, value.c_str (), value.size ());
+	if (!digest) {
+		throw std::runtime_error ("failed to compute sha256");
+	}
+	std::string result = std::string ("sha256:") + digest;
+	g_free (digest);
+	return result;
 }
 
 static std::string
@@ -626,6 +682,127 @@ observe_session_json (Session& session)
 	return out.str ();
 }
 
+static std::string
+observe_hash (Session* session)
+{
+	if (!session) {
+		return "";
+	}
+	return sha256_json (observe_session_json (*session));
+}
+
+static std::string
+journal_snapshot_path (std::string const& journal_path)
+{
+	std::string dirname = Glib::path_get_dirname (journal_path);
+	if (dirname == ".") {
+		return ".reson/snapshots/batch_0001_before.tar.zst";
+	}
+	return Glib::build_filename (dirname, "snapshots", "batch_0001_before.tar.zst");
+}
+
+static void
+append_touched (std::ostringstream& out, std::string const& key, std::string const& value, bool& first)
+{
+	if (value.empty ()) {
+		return;
+	}
+	if (!first) {
+		out << ",";
+	}
+	first = false;
+	out << "\"" << key << "\":[\"" << json_escape (value) << "\"]";
+}
+
+static std::string
+touched_json (JournalEntry const& entry)
+{
+	std::ostringstream out;
+	bool               first = true;
+
+	out << "{";
+	append_touched (out, "tracks", entry.touched_tracks, first);
+	append_touched (out, "playlists", entry.touched_playlists, first);
+	append_touched (out, "regions", entry.touched_regions, first);
+	append_touched (out, "sources", entry.touched_sources, first);
+	out << "}";
+	return out.str ();
+}
+
+static void
+write_command_journal (
+	std::string const&              journal_path,
+	std::string const&              created_at,
+	Session*                        session,
+	std::vector<JournalEntry> const& entries)
+{
+	std::string dirname = Glib::path_get_dirname (journal_path);
+	if (!dirname.empty () && dirname != ".") {
+		g_mkdir_with_parents (dirname.c_str (), 0755);
+	}
+
+	std::string snapshot_path = journal_snapshot_path (journal_path);
+	std::string snapshot_dir  = Glib::path_get_dirname (snapshot_path);
+	if (!snapshot_dir.empty () && snapshot_dir != ".") {
+		g_mkdir_with_parents (snapshot_dir.c_str (), 0755);
+	}
+
+	std::ostringstream out;
+	out << "{\"schemaVersion\":\"reson.command_journal.v0\""
+	    << ",\"journalId\":\"" << json_escape (PBD::basename_nosuffix (Glib::path_get_basename (journal_path))) << "\""
+	    << ",\"session\":{";
+	if (session) {
+		out << "\"name\":\"" << json_escape (session->name ()) << "\""
+		    << ",\"sampleRate\":" << session->nominal_sample_rate ();
+	}
+	out << "}"
+	    << ",\"createdAt\":\"" << json_escape (created_at) << "\""
+	    << ",\"bridge\":{\"name\":\"ardour-session-utils\",\"version\":\"spike\",\"engineVersion\":\"" << json_escape (VERSIONSTRING) << "\"}"
+	    << ",\"batches\":[{\"batchId\":\"batch_0001\""
+	    << ",\"reason\":\"command-file\""
+	    << ",\"risk\":\"normal\""
+	    << ",\"startedAt\":\"" << json_escape (created_at) << "\""
+	    << ",\"completedAt\":\"" << json_escape (utc_now_json ()) << "\""
+	    << ",\"status\":\"applied\""
+	    << ",\"preState\":{\"snapshot\":{\"kind\":\"session_archive\",\"path\":\"" << json_escape (snapshot_path) << "\"}}"
+	    << ",\"postState\":{";
+	if (session) {
+		out << "\"observationHash\":\"" << observe_hash (session) << "\"";
+	}
+	out << "},\"entries\":[";
+
+	for (std::vector<JournalEntry>::const_iterator i = entries.begin (); i != entries.end (); ++i) {
+		if (i != entries.begin ()) {
+			out << ",";
+		}
+		out << "{\"entryId\":\"" << json_escape (i->entry_id) << "\""
+		    << ",\"op\":\"" << json_escape (i->op) << "\""
+		    << ",\"commandSchemaVersion\":\"reson.command.v0\""
+		    << ",\"command\":" << i->command_json
+		    << ",\"status\":\"" << json_escape (i->status) << "\""
+		    << ",\"startedAt\":\"" << json_escape (created_at) << "\""
+		    << ",\"completedAt\":\"" << json_escape (created_at) << "\""
+		    << ",\"touched\":" << touched_json (*i)
+		    << ",\"preState\":{";
+		if (!i->pre_hash.empty ()) {
+			out << "\"observationHash\":\"" << i->pre_hash << "\"";
+		}
+		out << "},\"postState\":{";
+		if (!i->post_hash.empty ()) {
+			out << "\"observationHash\":\"" << i->post_hash << "\"";
+		}
+		out << "},\"rollback\":{\"kind\":\"restore_batch_snapshot\",\"batchId\":\"batch_0001\"}}";
+	}
+
+	out << "]}]}";
+
+	std::ofstream journal (journal_path.c_str (), std::ios::out | std::ios::trunc);
+	if (!journal) {
+		throw std::runtime_error ("cannot write journal: " + journal_path);
+	}
+	journal << out.str () << "\n";
+}
+
 static void
 require_session (Session* session, std::string const& op)
 {
@@ -671,6 +848,10 @@ main (int argc, char* argv[])
 	Session*           session = 0;
 	std::ostringstream result;
 	bool               first_result = true;
+	std::string        journal_path = root.get<std::string> ("journalPath", "");
+	std::string        journal_started_at = utc_now_json ();
+	std::vector<JournalEntry> journal_entries;
+	uint32_t           journal_entry_count = 0;
 
 	result << "{\"schemaVersion\":\"reson.result.v0\",\"results\":[";
 
@@ -680,6 +861,18 @@ main (int argc, char* argv[])
 		for (pt::ptree::const_iterator i = commands.begin (); i != commands.end (); ++i) {
 			pt::ptree const& command = i->second;
 			std::string      op      = command.get<std::string> ("op");
+			JournalEntry     journal_entry;
+
+			if (!journal_path.empty ()) {
+				++journal_entry_count;
+				std::ostringstream entry_id;
+				entry_id << "entry_" << std::setfill ('0') << std::setw (4) << journal_entry_count;
+				journal_entry.entry_id = entry_id.str ();
+				journal_entry.op = op;
+				journal_entry.command_json = ptree_json (command);
+				journal_entry.status = "applied";
+				journal_entry.pre_hash = observe_hash (session);
+			}
 
 			if (!first_result) {
 				result << ",";
@@ -746,6 +939,12 @@ main (int argc, char* argv[])
 						result << ",";
 					}
 					first_track = false;
+					if (!journal_path.empty () && journal_entry.touched_tracks.empty ()) {
+						journal_entry.touched_tracks = (*t)->id ().to_s ();
+						if ((*t)->playlist ()) {
+							journal_entry.touched_playlists = (*t)->playlist ()->id ().to_s ();
+						}
+					}
 					result << "{\"id\":\"" << json_escape ((*t)->id ().to_s ()) << "\""
 					       << ",\"name\":\"" << json_escape ((*t)->name ()) << "\"}";
 				}
@@ -836,6 +1035,12 @@ main (int argc, char* argv[])
 				playlist->clear_changes ();
 				playlist->clear_owned_changes ();
 				playlist->add_region (copy, timepos_t (start));
+				if (!journal_path.empty ()) {
+					journal_entry.touched_tracks = track->id ().to_s ();
+					journal_entry.touched_playlists = playlist->id ().to_s ();
+					journal_entry.touched_regions = copy->id ().to_s ();
+					journal_entry.touched_sources = sources[0]->id ().to_s ();
+				}
 
 				result << ",\"ok\":true,\"path\":\"" << json_escape (path) << "\""
 				       << ",\"sourceCount\":" << sources.size ()
@@ -887,6 +1092,11 @@ main (int argc, char* argv[])
 					location.playlist->remove_region (location.region);
 					target_track->playlist ()->add_region (location.region, timepos_t (start));
 				}
+				if (!journal_path.empty ()) {
+					journal_entry.touched_tracks = target_track->id ().to_s ();
+					journal_entry.touched_playlists = target_track->playlist ()->id ().to_s ();
+					journal_entry.touched_regions = location.region->id ().to_s ();
+				}
 
 				result << ",\"ok\":true,\"regionId\":\"" << json_escape (location.region->id ().to_s ()) << "\""
 				       << ",\"regionName\":\"" << json_escape (location.region->name ()) << "\""
@@ -933,7 +1143,16 @@ main (int argc, char* argv[])
 				throw std::runtime_error ("unsupported operation: " + op);
 			}
 
+			if (!journal_path.empty ()) {
+				journal_entry.post_hash = observe_hash (session);
+				journal_entries.push_back (journal_entry);
+			}
+
 			result << "}";
+		}
+
+		if (!journal_path.empty ()) {
+			write_command_journal (journal_path, journal_started_at, session, journal_entries);
 		}
 
 	} catch (std::exception const& e) {
