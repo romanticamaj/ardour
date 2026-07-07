@@ -11,6 +11,8 @@
 #include <cstdlib>
 #include <cmath>
 #include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -18,6 +20,8 @@
 #include <string>
 #include <vector>
 
+#include <archive.h>
+#include <archive_entry.h>
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
 #include <glibmm.h>
@@ -52,6 +56,7 @@
 using namespace ARDOUR;
 using namespace SessionUtils;
 namespace pt = boost::property_tree;
+namespace fs = std::filesystem;
 
 struct RenderSettings
 {
@@ -73,6 +78,24 @@ struct RegionLocation
 	std::shared_ptr<AudioTrack> track;
 	std::shared_ptr<Playlist>   playlist;
 	std::shared_ptr<Region>     region;
+};
+
+struct SnapshotInfo
+{
+	std::string path;
+	std::string sha256;
+	bool        captured = false;
+};
+
+struct RollbackPoint
+{
+	std::string rollback_id;
+	std::string snapshot_path;
+	std::string snapshot_sha256;
+	std::string session_dir;
+	std::string session_name;
+	std::string pre_hash;
+	std::string post_hash;
 };
 
 static double
@@ -632,6 +655,34 @@ sha256_json (std::string const& value)
 }
 
 static std::string
+sha256_file (std::string const& path)
+{
+	GChecksum* checksum = g_checksum_new (G_CHECKSUM_SHA256);
+	if (!checksum) {
+		throw std::runtime_error ("failed to create sha256 checksum");
+	}
+
+	std::ifstream file (path.c_str (), std::ios::in | std::ios::binary);
+	if (!file) {
+		g_checksum_free (checksum);
+		throw std::runtime_error ("cannot read file for sha256: " + path);
+	}
+
+	char buffer[16384];
+	while (file) {
+		file.read (buffer, sizeof (buffer));
+		std::streamsize count = file.gcount ();
+		if (count > 0) {
+			g_checksum_update (checksum, reinterpret_cast<guchar const*> (buffer), count);
+		}
+	}
+
+	std::string result = std::string ("sha256:") + g_checksum_get_string (checksum);
+	g_checksum_free (checksum);
+	return result;
+}
+
+static std::string
 observe_hash (Session* session)
 {
 	if (!session) {
@@ -644,6 +695,188 @@ static std::string
 default_session_name (std::string const& session_dir)
 {
 	return Glib::path_get_basename (session_dir);
+}
+
+static void
+archive_check (int rc, archive* ar, std::string const& action)
+{
+	if (rc != ARCHIVE_OK) {
+		std::string detail = archive_error_string (ar) ? archive_error_string (ar) : "unknown archive error";
+		throw std::runtime_error (action + ": " + detail);
+	}
+}
+
+static void
+write_file_to_archive (archive* ar, fs::path const& file_path)
+{
+	std::ifstream file (file_path, std::ios::in | std::ios::binary);
+	if (!file) {
+		throw std::runtime_error ("cannot read snapshot file: " + file_path.string ());
+	}
+
+	char buffer[16384];
+	while (file) {
+		file.read (buffer, sizeof (buffer));
+		std::streamsize count = file.gcount ();
+		if (count > 0 && archive_write_data (ar, buffer, count) < 0) {
+			throw std::runtime_error ("write snapshot data: " + std::string (archive_error_string (ar)));
+		}
+	}
+}
+
+static void
+capture_session_snapshot (std::string const& session_dir, SnapshotInfo& snapshot)
+{
+	if (snapshot.captured) {
+		return;
+	}
+	if (session_dir.empty ()) {
+		throw std::runtime_error ("cannot capture snapshot without a sessionDir");
+	}
+	if (!fs::exists (session_dir)) {
+		throw std::runtime_error ("cannot capture snapshot; sessionDir does not exist: " + session_dir);
+	}
+
+	std::string snapshot_dir = Glib::path_get_dirname (snapshot.path);
+	if (!snapshot_dir.empty () && snapshot_dir != ".") {
+		g_mkdir_with_parents (snapshot_dir.c_str (), 0755);
+	}
+
+	archive* ar = archive_write_new ();
+	if (!ar) {
+		throw std::runtime_error ("cannot allocate snapshot archive");
+	}
+
+	try {
+		archive_check (archive_write_add_filter_gzip (ar), ar, "enable gzip snapshot filter");
+		archive_check (archive_write_set_format_pax_restricted (ar), ar, "set snapshot archive format");
+		archive_check (archive_write_open_filename (ar, snapshot.path.c_str ()), ar, "open snapshot archive");
+
+		fs::path root (session_dir);
+		for (fs::recursive_directory_iterator i (root), end; i != end; ++i) {
+			fs::path path = i->path ();
+			fs::path rel = fs::relative (path, root);
+			if (rel.empty ()) {
+				continue;
+			}
+
+			archive_entry* entry = archive_entry_new ();
+			if (!entry) {
+				throw std::runtime_error ("cannot allocate snapshot archive entry");
+			}
+
+			std::string rel_name = rel.generic_string ();
+			archive_entry_set_pathname (entry, rel_name.c_str ());
+			if (fs::is_directory (path)) {
+				archive_entry_set_filetype (entry, AE_IFDIR);
+				archive_entry_set_perm (entry, 0755);
+				archive_entry_set_size (entry, 0);
+				archive_check (archive_write_header (ar, entry), ar, "write snapshot directory header");
+			} else if (fs::is_regular_file (path)) {
+				archive_entry_set_filetype (entry, AE_IFREG);
+				archive_entry_set_perm (entry, 0644);
+				archive_entry_set_size (entry, fs::file_size (path));
+				archive_check (archive_write_header (ar, entry), ar, "write snapshot file header");
+				write_file_to_archive (ar, path);
+			}
+			archive_entry_free (entry);
+		}
+
+		archive_check (archive_write_close (ar), ar, "close snapshot archive");
+		archive_write_free (ar);
+		ar = 0;
+		snapshot.sha256 = sha256_file (snapshot.path);
+		snapshot.captured = true;
+	} catch (...) {
+		if (ar) {
+			archive_write_close (ar);
+			archive_write_free (ar);
+		}
+		throw;
+	}
+}
+
+static bool
+safe_archive_path (std::string const& name)
+{
+	fs::path path (name);
+	if (path.is_absolute ()) {
+		return false;
+	}
+	for (fs::path::const_iterator i = path.begin (); i != path.end (); ++i) {
+		if (*i == "..") {
+			return false;
+		}
+	}
+	return true;
+}
+
+static void
+restore_session_snapshot (std::string const& snapshot_path, std::string const& session_dir)
+{
+	if (snapshot_path.empty () || session_dir.empty ()) {
+		throw std::runtime_error ("restore snapshot requires snapshotPath and sessionDir");
+	}
+	if (!fs::exists (snapshot_path)) {
+		throw std::runtime_error ("snapshotPath does not exist: " + snapshot_path);
+	}
+
+	fs::remove_all (session_dir);
+	fs::create_directories (session_dir);
+
+	archive* ar = archive_read_new ();
+	if (!ar) {
+		throw std::runtime_error ("cannot allocate snapshot reader");
+	}
+
+	try {
+		archive_read_support_format_tar (ar);
+		archive_read_support_filter_gzip (ar);
+		archive_check (archive_read_open_filename (ar, snapshot_path.c_str (), 16384), ar, "open snapshot archive");
+
+		archive_entry* entry = 0;
+		while (true) {
+			int rc = archive_read_next_header (ar, &entry);
+			if (rc == ARCHIVE_EOF) {
+				break;
+			}
+			archive_check (rc, ar, "read snapshot entry");
+
+			std::string rel_name = archive_entry_pathname (entry) ? archive_entry_pathname (entry) : "";
+			if (!safe_archive_path (rel_name)) {
+				throw std::runtime_error ("unsafe snapshot entry path: " + rel_name);
+			}
+
+			fs::path target = fs::path (session_dir) / rel_name;
+			if (archive_entry_filetype (entry) == AE_IFDIR) {
+				fs::create_directories (target);
+			} else if (archive_entry_filetype (entry) == AE_IFREG) {
+				fs::create_directories (target.parent_path ());
+				std::ofstream file (target, std::ios::out | std::ios::binary | std::ios::trunc);
+				if (!file) {
+					throw std::runtime_error ("cannot restore snapshot file: " + target.string ());
+				}
+				char buffer[16384];
+				while (true) {
+					ssize_t count = archive_read_data (ar, buffer, sizeof (buffer));
+					if (count == 0) {
+						break;
+					}
+					if (count < 0) {
+						throw std::runtime_error ("read snapshot data: " + std::string (archive_error_string (ar)));
+					}
+					file.write (buffer, count);
+				}
+			}
+		}
+
+		archive_check (archive_read_close (ar), ar, "close snapshot archive");
+		archive_read_free (ar);
+	} catch (...) {
+		archive_read_close (ar);
+		archive_read_free (ar);
+		throw;
+	}
 }
 
 static void
@@ -685,6 +918,10 @@ error_code (std::string const& message)
 	if (!message.compare (0, prefix.size (), prefix)) {
 		return "stale_observation";
 	}
+	prefix = "rollback_not_found: ";
+	if (!message.compare (0, prefix.size (), prefix)) {
+		return "rollback_not_found";
+	}
 	return "runtime_error";
 }
 
@@ -698,6 +935,10 @@ error_message (std::string const& message)
 	std::string stale_prefix = "stale_observation: ";
 	if (!message.compare (0, stale_prefix.size (), stale_prefix)) {
 		return message.substr (stale_prefix.size ());
+	}
+	std::string rollback_prefix = "rollback_not_found: ";
+	if (!message.compare (0, rollback_prefix.size (), rollback_prefix)) {
+		return message.substr (rollback_prefix.size ());
 	}
 	return message;
 }
@@ -921,6 +1162,10 @@ main (int argc, char* argv[])
 {
 	Session* session = 0;
 	std::string active_session_id;
+	std::string active_session_dir;
+	std::string active_session_name;
+	uint32_t rollback_counter = 0;
+	std::vector<RollbackPoint> rollback_points;
 	bool stop = false;
 
 	try {
@@ -945,7 +1190,7 @@ main (int argc, char* argv[])
 						request_id,
 						true,
 						"response",
-						"{\"protocolVersion\":0,\"capabilities\":[\"session.create\",\"session.observe\",\"commands.apply\",\"session.save\",\"render.preview\",\"session.close\",\"runtime.stop\"]}");
+						"{\"protocolVersion\":0,\"capabilities\":[\"session.create\",\"session.observe\",\"commands.apply\",\"session.save\",\"render.preview\",\"session.rollback\",\"session.close\",\"runtime.stop\"]}");
 				} else if (method == "runtime.stop") {
 					write_response (request_id, true, "response", "{\"stopped\":true}");
 					stop = true;
@@ -962,6 +1207,9 @@ main (int argc, char* argv[])
 					if (!session) {
 						throw std::runtime_error ("create_session failed");
 					}
+					active_session_dir = session_dir;
+					active_session_name = session_name;
+					rollback_points.clear ();
 					active_session_id = "session_" + sha256_json (session_dir + ":" + session_name).substr (7, 16);
 					write_response (
 						request_id,
@@ -991,6 +1239,9 @@ main (int argc, char* argv[])
 					session = 0;
 					std::string closed_session_id = active_session_id;
 					active_session_id.clear ();
+					active_session_dir.clear ();
+					active_session_name.clear ();
+					rollback_points.clear ();
 					write_response (request_id, true, "response", "{\"sessionId\":\"" + json_escape (closed_session_id) + "\",\"closed\":true}");
 				} else if (method == "render.preview") {
 					std::string session_id = body.get<std::string> ("sessionId");
@@ -1019,12 +1270,69 @@ main (int argc, char* argv[])
 					if (!expected_hash.empty () && expected_hash != observe_hash (session)) {
 						throw std::runtime_error ("stale_observation: expectedObservationHash does not match active session");
 					}
-					std::string results = apply_commands (session, body.get_child ("commands"));
+					if (session->save_state ("") != 0) {
+						throw std::runtime_error ("snapshot save_state failed");
+					}
+					RollbackPoint rollback;
+					rollback.rollback_id = "rollback_" + std::to_string (++rollback_counter);
+					rollback.session_dir = active_session_dir;
+					rollback.session_name = active_session_name;
+					rollback.pre_hash = observe_hash (session);
+					SnapshotInfo snapshot;
+					snapshot.path = Glib::build_filename (Glib::path_get_dirname (active_session_dir), ".siann", "snapshots", rollback.rollback_id + "_before.tar.gz");
+					capture_session_snapshot (active_session_dir, snapshot);
+					rollback.snapshot_path = snapshot.path;
+					rollback.snapshot_sha256 = snapshot.sha256;
+
+					std::string results;
+					try {
+						results = apply_commands (session, body.get_child ("commands"));
+					} catch (...) {
+						SessionUtils::unload_session (session);
+						session = 0;
+						restore_session_snapshot (snapshot.path, active_session_dir);
+						session = SessionUtils::load_session (active_session_dir, active_session_name);
+						if (!session) {
+							throw std::runtime_error ("failed to reload session after failed apply rollback");
+						}
+						throw;
+					}
+					rollback.post_hash = observe_hash (session);
+					rollback_points.push_back (rollback);
 					write_response (
 						request_id,
 						true,
 						"response",
-						"{\"sessionId\":\"" + json_escape (active_session_id) + "\",\"results\":" + results + ",\"observationHash\":\"" + observe_hash (session) + "\"}");
+						"{\"sessionId\":\"" + json_escape (active_session_id) + "\",\"results\":" + results + ",\"observationHash\":\"" + rollback.post_hash + "\",\"rollback\":{\"rollbackId\":\"" + json_escape (rollback.rollback_id) + "\",\"snapshotPath\":\"" + json_escape (rollback.snapshot_path) + "\",\"snapshotSha256\":\"" + json_escape (rollback.snapshot_sha256) + "\",\"preObservationHash\":\"" + rollback.pre_hash + "\",\"postObservationHash\":\"" + rollback.post_hash + "\"}}");
+				} else if (method == "session.rollback") {
+					std::string session_id = body.get<std::string> ("sessionId");
+					std::string rollback_id = body.get<std::string> ("rollbackId");
+					require_session_id (session_id, active_session_id);
+					std::vector<RollbackPoint>::const_iterator rollback = rollback_points.end ();
+					for (std::vector<RollbackPoint>::const_iterator r = rollback_points.begin (); r != rollback_points.end (); ++r) {
+						if (r->rollback_id == rollback_id) {
+							rollback = r;
+							break;
+						}
+					}
+					if (rollback == rollback_points.end ()) {
+						throw std::runtime_error ("rollback_not_found: unknown rollbackId");
+					}
+					SessionUtils::unload_session (session);
+					session = 0;
+					restore_session_snapshot (rollback->snapshot_path, rollback->session_dir);
+					session = SessionUtils::load_session (rollback->session_dir, rollback->session_name);
+					if (!session) {
+						throw std::runtime_error ("session.rollback failed to reload session");
+					}
+					active_session_dir = rollback->session_dir;
+					active_session_name = rollback->session_name;
+					rollback_points.erase (rollback, rollback_points.end ());
+					write_response (
+						request_id,
+						true,
+						"response",
+						"{\"sessionId\":\"" + json_escape (active_session_id) + "\",\"rollbackId\":\"" + json_escape (rollback_id) + "\",\"rolledBack\":true,\"observationHash\":\"" + observe_hash (session) + "\"}");
 				} else {
 					throw std::runtime_error ("unsupported method: " + method);
 				}
