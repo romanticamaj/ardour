@@ -145,6 +145,18 @@ json_escape (std::string const& input)
 }
 
 static std::string
+ptree_json (pt::ptree const& tree)
+{
+	std::ostringstream out;
+	pt::write_json (out, tree, false);
+	std::string json = out.str ();
+	while (!json.empty () && (json[json.size () - 1] == '\n' || json[json.size () - 1] == '\r')) {
+		json.erase (json.size () - 1);
+	}
+	return json;
+}
+
+static std::string
 data_type_name (DataType const& type)
 {
 	if (type == DataType::AUDIO) {
@@ -888,6 +900,40 @@ require_session_id (std::string const& request_session_id, std::string const& ac
 }
 
 static void
+write_runtime_journal (
+	std::string const& journal_path,
+	std::string const& session_id,
+	Session*           session,
+	std::vector<std::string> const& entries)
+{
+	std::string dirname = Glib::path_get_dirname (journal_path);
+	if (!dirname.empty () && dirname != ".") {
+		g_mkdir_with_parents (dirname.c_str (), 0755);
+	}
+
+	std::ofstream journal (journal_path.c_str (), std::ios::out | std::ios::trunc);
+	if (!journal) {
+		throw std::runtime_error ("cannot write runtime journal: " + journal_path);
+	}
+
+	journal << "{\"schemaVersion\":\"siann.runtime_journal.v0\""
+	        << ",\"session\":{";
+	if (session) {
+		journal << "\"sessionId\":\"" << json_escape (session_id) << "\""
+		        << ",\"name\":\"" << json_escape (session->name ()) << "\""
+		        << ",\"sampleRate\":" << session->nominal_sample_rate ();
+	}
+	journal << "},\"entries\":[";
+	for (std::vector<std::string>::const_iterator i = entries.begin (); i != entries.end (); ++i) {
+		if (i != entries.begin ()) {
+			journal << ",";
+		}
+		journal << *i;
+	}
+	journal << "]}\n";
+}
+
+static void
 write_response (std::string const& request_id, bool ok, std::string const& type, std::string const& body_json)
 {
 	std::cout << "{\"requestId\":\"" << json_escape (request_id) << "\""
@@ -1164,8 +1210,10 @@ main (int argc, char* argv[])
 	std::string active_session_id;
 	std::string active_session_dir;
 	std::string active_session_name;
+	std::string runtime_journal_path;
 	uint32_t rollback_counter = 0;
 	std::vector<RollbackPoint> rollback_points;
+	std::vector<std::string> runtime_journal_entries;
 	bool stop = false;
 
 	try {
@@ -1209,8 +1257,11 @@ main (int argc, char* argv[])
 					}
 					active_session_dir = session_dir;
 					active_session_name = session_name;
+					runtime_journal_path = Glib::build_filename (Glib::path_get_dirname (active_session_dir), ".siann", "runtime-journal.json");
 					rollback_points.clear ();
+					runtime_journal_entries.clear ();
 					active_session_id = "session_" + sha256_json (session_dir + ":" + session_name).substr (7, 16);
+					write_runtime_journal (runtime_journal_path, active_session_id, session, runtime_journal_entries);
 					write_response (
 						request_id,
 						true,
@@ -1241,7 +1292,9 @@ main (int argc, char* argv[])
 					active_session_id.clear ();
 					active_session_dir.clear ();
 					active_session_name.clear ();
+					runtime_journal_path.clear ();
 					rollback_points.clear ();
+					runtime_journal_entries.clear ();
 					write_response (request_id, true, "response", "{\"sessionId\":\"" + json_escape (closed_session_id) + "\",\"closed\":true}");
 				} else if (method == "render.preview") {
 					std::string session_id = body.get<std::string> ("sessionId");
@@ -1285,6 +1338,7 @@ main (int argc, char* argv[])
 					rollback.snapshot_sha256 = snapshot.sha256;
 
 					std::string results;
+					std::string commands_json = ptree_json (body.get_child ("commands"));
 					try {
 						results = apply_commands (session, body.get_child ("commands"));
 					} catch (...) {
@@ -1299,11 +1353,25 @@ main (int argc, char* argv[])
 					}
 					rollback.post_hash = observe_hash (session);
 					rollback_points.push_back (rollback);
+					std::ostringstream journal_entry;
+					journal_entry << "{\"entryId\":\"entry_" << runtime_journal_entries.size () + 1 << "\""
+					              << ",\"requestId\":\"" << json_escape (request_id) << "\""
+					              << ",\"method\":\"commands.apply\""
+					              << ",\"commands\":" << commands_json
+					              << ",\"results\":" << results
+					              << ",\"preObservationHash\":\"" << rollback.pre_hash << "\""
+					              << ",\"postObservationHash\":\"" << rollback.post_hash << "\""
+					              << ",\"rollback\":{\"rollbackId\":\"" << json_escape (rollback.rollback_id) << "\""
+					              << ",\"snapshotPath\":\"" << json_escape (rollback.snapshot_path) << "\""
+					              << ",\"snapshotSha256\":\"" << json_escape (rollback.snapshot_sha256) << "\"}"
+					              << "}";
+					runtime_journal_entries.push_back (journal_entry.str ());
+					write_runtime_journal (runtime_journal_path, active_session_id, session, runtime_journal_entries);
 					write_response (
 						request_id,
 						true,
 						"response",
-						"{\"sessionId\":\"" + json_escape (active_session_id) + "\",\"results\":" + results + ",\"observationHash\":\"" + rollback.post_hash + "\",\"rollback\":{\"rollbackId\":\"" + json_escape (rollback.rollback_id) + "\",\"snapshotPath\":\"" + json_escape (rollback.snapshot_path) + "\",\"snapshotSha256\":\"" + json_escape (rollback.snapshot_sha256) + "\",\"preObservationHash\":\"" + rollback.pre_hash + "\",\"postObservationHash\":\"" + rollback.post_hash + "\"}}");
+						"{\"sessionId\":\"" + json_escape (active_session_id) + "\",\"results\":" + results + ",\"observationHash\":\"" + rollback.post_hash + "\",\"rollback\":{\"rollbackId\":\"" + json_escape (rollback.rollback_id) + "\",\"snapshotPath\":\"" + json_escape (rollback.snapshot_path) + "\",\"snapshotSha256\":\"" + json_escape (rollback.snapshot_sha256) + "\",\"preObservationHash\":\"" + rollback.pre_hash + "\",\"postObservationHash\":\"" + rollback.post_hash + "\"},\"journal\":{\"path\":\"" + json_escape (runtime_journal_path) + "\",\"entryCount\":" + std::to_string (runtime_journal_entries.size ()) + "}}");
 				} else if (method == "session.rollback") {
 					std::string session_id = body.get<std::string> ("sessionId");
 					std::string rollback_id = body.get<std::string> ("rollbackId");
@@ -1328,6 +1396,15 @@ main (int argc, char* argv[])
 					active_session_dir = rollback->session_dir;
 					active_session_name = rollback->session_name;
 					rollback_points.erase (rollback, rollback_points.end ());
+					std::ostringstream journal_entry;
+					journal_entry << "{\"entryId\":\"entry_" << runtime_journal_entries.size () + 1 << "\""
+					              << ",\"requestId\":\"" << json_escape (request_id) << "\""
+					              << ",\"method\":\"session.rollback\""
+					              << ",\"rollbackId\":\"" << json_escape (rollback_id) << "\""
+					              << ",\"observationHash\":\"" << observe_hash (session) << "\""
+					              << "}";
+					runtime_journal_entries.push_back (journal_entry.str ());
+					write_runtime_journal (runtime_journal_path, active_session_id, session, runtime_journal_entries);
 					write_response (
 						request_id,
 						true,
