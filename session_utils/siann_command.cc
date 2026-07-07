@@ -603,7 +603,7 @@ render_session (Session& session, std::string const& outfile, RenderSettings con
 	std::ostringstream format_xml;
 	format_xml
 		<< "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
-		<< "<ExportFormatSpecification name=\"RESON-WAV-EXPORT\" id=\"b1280899-0459-4aef-9dc9-7e2277fa6d24\">"
+		<< "<ExportFormatSpecification name=\"SIANN-WAV-EXPORT\" id=\"b1280899-0459-4aef-9dc9-7e2277fa6d24\">"
 		<< "  <Encoding id=\"F_WAV\" type=\"T_Sndfile\" extension=\"wav\" name=\"WAV\" has-sample-format=\"true\" channel-limit=\"256\"/>"
 		<< "  <SampleRate rate=\"" << sample_rate << "\"/>"
 		<< "  <SRCQuality quality=\"SRC_SincBest\"/>"
@@ -751,7 +751,7 @@ journal_snapshot_path (std::string const& journal_path)
 	std::string journal_name = PBD::basename_nosuffix (Glib::path_get_basename (journal_path));
 	std::string snapshot_name = journal_name + "_batch_0001_before.tar.gz";
 	if (dirname == ".") {
-		return Glib::build_filename (".reson", "snapshots", snapshot_name);
+		return Glib::build_filename (".siann", "snapshots", snapshot_name);
 	}
 	return Glib::build_filename (dirname, "snapshots", snapshot_name);
 }
@@ -1019,7 +1019,7 @@ write_command_journal (
 	}
 
 	std::ostringstream out;
-	out << "{\"schemaVersion\":\"reson.command_journal.v0\""
+	out << "{\"schemaVersion\":\"siann.command_journal.v0\""
 	    << ",\"journalId\":\"" << json_escape (PBD::basename_nosuffix (Glib::path_get_basename (journal_path))) << "\""
 	    << ",\"session\":{";
 	if (session) {
@@ -1052,7 +1052,7 @@ write_command_journal (
 		}
 		out << "{\"entryId\":\"" << json_escape (i->entry_id) << "\""
 		    << ",\"op\":\"" << json_escape (i->op) << "\""
-		    << ",\"commandSchemaVersion\":\"reson.command.v0\""
+		    << ",\"commandSchemaVersion\":\"siann.command.v0\""
 		    << ",\"command\":" << i->command_json
 		    << ",\"status\":\"" << json_escape (i->status) << "\""
 		    << ",\"startedAt\":\"" << json_escape (created_at) << "\""
@@ -1099,12 +1099,12 @@ default_session_name (std::string const& session_dir)
 static void
 usage ()
 {
-	std::cout << UTILNAME << " - run Reson JSON commands against an Ardour session.\n\n";
+	std::cout << UTILNAME << " - run SIANN JSON commands against an Ardour session.\n\n";
 	std::cout << "Usage: " << UTILNAME << " <command-file.json>\n\n";
 	std::cout << "Supported operations:\n";
 	std::cout << "  create_session, open_session, restore_batch_snapshot, create_audio_track, import_audio, place_audio, render, save_session, observe_session\n\n";
 	std::cout << "Example:\n";
-	std::cout << "  " << UTILNAME << " /tmp/reson-command.json\n";
+	std::cout << "  " << UTILNAME << " /tmp/siann-command.json\n";
 	::exit (EXIT_SUCCESS);
 }
 
@@ -1144,7 +1144,7 @@ main (int argc, char* argv[])
 		snapshot.path = journal_snapshot_path (journal_path);
 	}
 
-	result << "{\"schemaVersion\":\"reson.result.v0\",\"results\":[";
+	result << "{\"schemaVersion\":\"siann.result.v0\",\"results\":[";
 
 	try {
 		batch_risk = validated_batch_risk (batch_risk_input);
