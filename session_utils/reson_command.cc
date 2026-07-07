@@ -1285,8 +1285,11 @@ main (int argc, char* argv[])
 				std::string track_name   = command.get<std::string> ("trackName", "");
 				std::string region_name  = command.get<std::string> ("regionName", "");
 				std::string start_value  = command.get<std::string> ("start", "0");
+				std::string source_start_value = command.get<std::string> ("sourceStart", "0");
+				std::string duration_value = command.get<std::string> ("duration", "");
 				bool        create_track = command.get<bool> ("createTrack", false);
 				samplepos_t start        = parse_position (*session, start_value);
+				samplepos_t source_start = parse_position (*session, source_start_value);
 
 				ImportStatus status;
 				status.current                 = 0;
@@ -1335,13 +1338,27 @@ main (int argc, char* argv[])
 				if (!track) {
 					throw std::runtime_error ("import_audio requires an existing audio track or createTrack=true");
 				}
+				if (source_start < 0) {
+					throw std::runtime_error ("import_audio sourceStart must be >= 0");
+				}
+				if (source_start >= sources[0]->length ().samples ()) {
+					throw std::runtime_error ("import_audio sourceStart is beyond source length");
+				}
+				samplecnt_t region_length = sources[0]->length ().samples () - source_start;
+				if (!duration_value.empty ()) {
+					samplepos_t parsed_duration = parse_position (*session, duration_value);
+					if (parsed_duration <= 0) {
+						throw std::runtime_error ("import_audio duration must be > 0");
+					}
+					region_length = std::min<samplecnt_t> (parsed_duration, sources[0]->length ().samples () - source_start);
+				}
 
 				PBD::PropertyList plist;
-				plist.add (Properties::start, timecnt_t (Temporal::AudioTime));
-				plist.add (Properties::length, sources[0]->length ());
+				plist.add (Properties::start, timecnt_t (source_start, timepos_t (Temporal::AudioTime)));
+				plist.add (Properties::length, timecnt_t (region_length, timepos_t (source_start)));
 				plist.add (Properties::name, region_name);
 				plist.add (Properties::layer, 0);
-				plist.add (Properties::whole_file, true);
+				plist.add (Properties::whole_file, source_start == 0 && region_length == sources[0]->length ().samples ());
 				plist.add (Properties::external, true);
 				plist.add (Properties::opaque, true);
 
@@ -1375,7 +1392,9 @@ main (int argc, char* argv[])
 				       << ",\"trackName\":\"" << json_escape (track->name ()) << "\""
 				       << ",\"regionId\":\"" << json_escape (copy->id ().to_s ()) << "\""
 				       << ",\"regionName\":\"" << json_escape (copy->name ()) << "\""
-				       << ",\"start\":" << start;
+				       << ",\"start\":" << start
+				       << ",\"sourceStart\":" << source_start
+				       << ",\"length\":" << region_length;
 
 			} else if (op == "place_audio") {
 				require_session (session, op);
